@@ -6,18 +6,24 @@ inputs, then delegates recursive comparison to ``DeepDiff``.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping as MappingABC
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
-from fnmatch import fnmatchcase
+import json
+import math
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .diff import DeepDiff
 
 
 _MISSING = object()
+_ARRAY_WILDCARD = object()
+_KEY_WILDCARD = object()
 JSONScalar = Optional[bool | int | float | str]
 FilterFunc = Callable[[Any], bool]
 Normalizer = Callable[[Any], Any]
+PathToken = str | int | object
 
 
 class MissingIdentityPolicy(str, Enum):
@@ -47,19 +53,71 @@ class DuplicateIdentityError(CollectionStrategyError):
     """Raised when an identity expected to be unique is duplicated."""
 
 
+def _as_non_empty_string_tuple(value: Any, field_name: str) -> Tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise CollectionStrategyError(f"{field_name} must be a sequence of non-empty strings")
+    result = tuple(value)
+    if any(not isinstance(item, str) or not item for item in result):
+        raise CollectionStrategyError(f"{field_name} must contain only non-empty strings")
+    return result
+
+
+def _parse_pattern(pattern: str) -> Tuple[PathToken, ...]:
+    """Parse the supported JSONPath-like collection selector into path tokens."""
+    if not isinstance(pattern, str) or not pattern.startswith("$"):
+        raise CollectionStrategyError("strategy path must be a string starting with '$'")
+    if pattern == "$":
+        return ()
+
+    tokens: List[PathToken] = []
+    index = 1
+    while index < len(pattern):
+        if pattern[index] == ".":
+            index += 1
+            start = index
+            while index < len(pattern) and pattern[index] not in ".[":
+                index += 1
+            token = pattern[start:index]
+            if not token:
+                raise CollectionStrategyError(f"invalid strategy path {pattern!r}")
+            tokens.append(_KEY_WILDCARD if token == "*" else token)
+            continue
+
+        if pattern[index] == "[":
+            close = pattern.find("]", index)
+            if close == -1:
+                raise CollectionStrategyError(f"invalid strategy path {pattern!r}")
+            token = pattern[index + 1 : close]
+            if token == "*":
+                tokens.append(_ARRAY_WILDCARD)
+            elif token.isdigit():
+                tokens.append(int(token))
+            else:
+                raise CollectionStrategyError(
+                    "bracket selectors must contain an integer index or '*'"
+                )
+            index = close + 1
+            continue
+
+        raise CollectionStrategyError(f"invalid strategy path {pattern!r}")
+
+    return tuple(tokens)
+
+
 @dataclass(frozen=True)
 class CollectionStrategy:
     """Rules applied to a JSON array selected by ``path``.
 
-    ``path`` uses a small, deterministic JSONPath-like dialect. Supported
-    patterns include exact paths (``$.users``), single-level wildcards
-    (``$.accounts[*].users``), and recursive wildcards (``$.*.items`` through
-    standard ``fnmatch`` semantics).
+    ``path`` supports exact object keys and array indexes, one-key wildcards
+    (``$.*.users``), and one-index array wildcards
+    (``$.accounts[*].users``).
 
     ``match_by`` converts an array of objects into a mapping keyed by semantic
     identity. This avoids index-based cascading diffs when items are added,
     removed, or reordered. ``sort_by`` provides deterministic ordering where
     semantic matching is not configured, and also orders duplicate groups.
+    ``compare_as_set`` performs order-insensitive multiset comparison, so
+    duplicate values remain significant.
     """
 
     path: str
@@ -73,16 +131,55 @@ class CollectionStrategy:
     duplicates: DuplicateIdentityPolicy = DuplicateIdentityPolicy.ERROR
     priority: int = 0
     name: Optional[str] = None
+    _pattern_tokens: Tuple[PathToken, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.path.startswith("$"):
-            raise CollectionStrategyError("strategy path must start with '$'")
-        if self.compare_as_set and self.match_by:
-            raise CollectionStrategyError("compare_as_set and match_by are mutually exclusive")
+        pattern_tokens = _parse_pattern(self.path)
+        match_by = _as_non_empty_string_tuple(self.match_by, "match_by")
+        sort_by = _as_non_empty_string_tuple(self.sort_by, "sort_by")
+        exclude_fields = _as_non_empty_string_tuple(self.exclude_fields, "exclude_fields")
+
+        if isinstance(self.normalizers, (str, bytes)) or not isinstance(
+            self.normalizers, Sequence
+        ):
+            raise CollectionStrategyError("normalizers must be a sequence of callables")
+        normalizers = tuple(self.normalizers)
+        if any(not callable(item) for item in normalizers):
+            raise CollectionStrategyError("all normalizers must be callable")
+
         if self.filter_func is not None and not callable(self.filter_func):
             raise CollectionStrategyError("filter_func must be callable")
-        if any(not callable(item) for item in self.normalizers):
-            raise CollectionStrategyError("all normalizers must be callable")
+        if not isinstance(self.compare_as_set, bool):
+            raise CollectionStrategyError("compare_as_set must be a boolean")
+        if self.compare_as_set and match_by:
+            raise CollectionStrategyError("compare_as_set and match_by are mutually exclusive")
+        if self.compare_as_set and sort_by:
+            raise CollectionStrategyError("compare_as_set and sort_by are mutually exclusive")
+        if not isinstance(self.priority, int) or isinstance(self.priority, bool):
+            raise CollectionStrategyError("priority must be an integer")
+        if self.name is not None and not isinstance(self.name, str):
+            raise CollectionStrategyError("name must be a string or None")
+
+        try:
+            missing_identity = MissingIdentityPolicy(self.missing_identity)
+        except (TypeError, ValueError) as exc:
+            raise CollectionStrategyError(
+                f"invalid missing_identity policy {self.missing_identity!r}"
+            ) from exc
+        try:
+            duplicates = DuplicateIdentityPolicy(self.duplicates)
+        except (TypeError, ValueError) as exc:
+            raise CollectionStrategyError(
+                f"invalid duplicates policy {self.duplicates!r}"
+            ) from exc
+
+        object.__setattr__(self, "match_by", match_by)
+        object.__setattr__(self, "sort_by", sort_by)
+        object.__setattr__(self, "exclude_fields", exclude_fields)
+        object.__setattr__(self, "normalizers", normalizers)
+        object.__setattr__(self, "missing_identity", missing_identity)
+        object.__setattr__(self, "duplicates", duplicates)
+        object.__setattr__(self, "_pattern_tokens", pattern_tokens)
 
 
 @dataclass
@@ -119,24 +216,32 @@ def _path_to_string(path: Tuple[Any, ...]) -> str:
     return result
 
 
-def _normalise_pattern(pattern: str) -> str:
-    # Make array wildcards compatible with fnmatch without treating brackets as
-    # a character class.
-    return pattern.replace("[*]", "[[]*[]]")
+def _pattern_matches(pattern: Tuple[PathToken, ...], path: Tuple[Any, ...]) -> bool:
+    if len(pattern) != len(path):
+        return False
+    for expected, actual in zip(pattern, path):
+        if expected is _ARRAY_WILDCARD:
+            if not isinstance(actual, int):
+                return False
+        elif expected is _KEY_WILDCARD:
+            if not isinstance(actual, str):
+                return False
+        elif expected != actual:
+            return False
+    return True
 
 
 def _extract(value: Any, relative_path: str, default: Any = _MISSING) -> Any:
     """Extract a dotted relative path from mappings and integer-indexed lists."""
-
     current = value
-    if not relative_path:
-        return current
     for token in relative_path.split("."):
         if isinstance(current, Mapping):
             if token not in current:
                 return default
             current = current[token]
-        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes, bytearray)):
+        elif isinstance(current, Sequence) and not isinstance(
+            current, (str, bytes, bytearray)
+        ):
             try:
                 current = current[int(token)]
             except (ValueError, IndexError):
@@ -146,32 +251,62 @@ def _extract(value: Any, relative_path: str, default: Any = _MISSING) -> Any:
     return current
 
 
-def _stable_value(value: Any) -> Tuple[str, str]:
-    """Return a total, deterministic ordering key for heterogeneous JSON values."""
-
+def _stable_value(value: Any) -> Tuple[int, Any]:
+    """Return a total, deterministic ordering key for supported JSON-like values."""
     if value is _MISSING:
-        return ("0-missing", "")
+        return (0, "")
     if value is None:
-        return ("1-null", "")
+        return (1, "")
     if isinstance(value, bool):
-        return ("2-bool", repr(value))
+        return (2, value)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return ("3-number", repr(value))
+        if isinstance(value, float) and not math.isfinite(value):
+            return (3, repr(value))
+        return (3, value)
     if isinstance(value, str):
-        return ("4-string", value)
-    return (f"5-{type(value).__name__}", repr(value))
+        return (4, value)
+    try:
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
+    except (TypeError, ValueError):
+        rendered = repr(value)
+    return (5, f"{type(value).__name__}:{rendered}")
 
 
-def _identity_label(identity: Tuple[Any, ...]) -> str:
-    return "|".join(f"{kind}:{text}" for kind, text in (_stable_value(v) for v in identity))
+def _identity_component(value: Any, field_name: str, location: str) -> Tuple[str, Any]:
+    if value is None:
+        return ("null", None)
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise IdentityExtractionError(
+                f"identity field {field_name!r} at {location} must be finite"
+            )
+        return ("float", value)
+    if isinstance(value, str):
+        return ("str", value)
+    raise IdentityExtractionError(
+        f"identity field {field_name!r} at {location} must resolve to a JSON scalar; "
+        f"got {type(value).__name__}"
+    )
 
 
-class DeepJSONDiff:
-    """Compare arbitrary JSON-like values with path-scoped collection semantics.
+def _identity_label(
+    identity: Tuple[Any, ...],
+    fields: Tuple[str, ...],
+    location: str,
+) -> str:
+    encoded = [
+        _identity_component(value, field_name, location)
+        for field_name, value in zip(fields, identity)
+    ]
+    return json.dumps(encoded, ensure_ascii=False, separators=(",", ":"))
 
-    The resulting object delegates mapping-like behaviour and serialization to
-    the underlying :class:`DeepDiff` instance through ``diff``.
-    """
+
+class DeepJSONDiff(MappingABC[str, Any]):
+    """Compare arbitrary JSON-like values with path-scoped collection semantics."""
 
     def __init__(
         self,
@@ -201,7 +336,8 @@ class DeepJSONDiff:
             key = (strategy.path, strategy.priority)
             if key in seen:
                 raise CollectionStrategyError(
-                    f"ambiguous strategies for path {strategy.path!r} at priority {strategy.priority}"
+                    f"ambiguous strategies for path {strategy.path!r} "
+                    f"at priority {strategy.priority}"
                 )
             seen[key] = strategy
 
@@ -210,14 +346,31 @@ class DeepJSONDiff:
         matches = [
             strategy
             for strategy in self.collection_strategies
-            if fnmatchcase(rendered, _normalise_pattern(strategy.path))
+            if _pattern_matches(strategy._pattern_tokens, path)
         ]
         if not matches:
             return None
-        matches.sort(key=lambda item: (item.priority, len(item.path)), reverse=True)
+        matches.sort(
+            key=lambda item: (
+                item.priority,
+                sum(
+                    token is not _ARRAY_WILDCARD and token is not _KEY_WILDCARD
+                    for token in item._pattern_tokens
+                ),
+            ),
+            reverse=True,
+        )
         if len(matches) > 1:
             first, second = matches[0], matches[1]
-            if first.priority == second.priority and len(first.path) == len(second.path):
+            first_specificity = sum(
+                token is not _ARRAY_WILDCARD and token is not _KEY_WILDCARD
+                for token in first._pattern_tokens
+            )
+            second_specificity = sum(
+                token is not _ARRAY_WILDCARD and token is not _KEY_WILDCARD
+                for token in second._pattern_tokens
+            )
+            if first.priority == second.priority and first_specificity == second_specificity:
                 raise CollectionStrategyError(
                     f"ambiguous collection strategies matched concrete path {rendered!r}"
                 )
@@ -242,7 +395,10 @@ class DeepJSONDiff:
         context: _Context,
     ) -> Any:
         if strategy is None:
-            return [self._canonicalize(item, path + (index,), context) for index, item in enumerate(values)]
+            return [
+                self._canonicalize(item, path + (index,), context)
+                for index, item in enumerate(values)
+            ]
 
         rendered = _path_to_string(path)
         stat = context.stats.setdefault(
@@ -256,14 +412,14 @@ class DeepJSONDiff:
 
         prepared: List[Tuple[int, Any]] = []
         for index, original in enumerate(values):
-            if strategy.filter_func is not None and not strategy.filter_func(original):
+            item = deepcopy(original)
+            if strategy.filter_func is not None and not strategy.filter_func(item):
                 if context.side == "left":
                     stat.filtered_left += 1
                 else:
                     stat.filtered_right += 1
                 continue
 
-            item = original
             for normalizer in strategy.normalizers:
                 item = normalizer(item)
             if isinstance(item, Mapping) and strategy.exclude_fields:
@@ -274,29 +430,38 @@ class DeepJSONDiff:
             prepared.append((index, item))
 
         if strategy.match_by:
-            return self._index_by_identity(prepared, strategy, context, stat)
+            return self._index_by_identity(prepared, path, strategy, context, stat)
 
         items = [item for _, item in prepared]
         if strategy.sort_by:
             items = sorted(
                 items,
-                key=lambda item: tuple(_stable_value(_extract(item, field)) for field in strategy.sort_by),
+                key=lambda item: tuple(
+                    _stable_value(_extract(item, field)) for field in strategy.sort_by
+                ),
             )
         elif strategy.compare_as_set:
+            if any(isinstance(item, (Mapping, list, tuple, set)) for item in items):
+                raise CollectionStrategyError(
+                    f"compare_as_set at {rendered} supports scalar items only"
+                )
             items = sorted(items, key=_stable_value)
         return items
 
     def _index_by_identity(
         self,
         prepared: List[Tuple[int, Any]],
+        path: Tuple[Any, ...],
         strategy: CollectionStrategy,
         context: _Context,
         stat: StrategyStats,
     ) -> Dict[str, Any]:
+        rendered = _path_to_string(path)
         grouped: Dict[str, List[Any]] = {}
         fallback: List[Any] = []
 
         for original_index, item in prepared:
+            item_location = f"{rendered}[{original_index}]"
             identity = tuple(_extract(item, field) for field in strategy.match_by)
             if any(value is _MISSING for value in identity):
                 if context.side == "left":
@@ -305,17 +470,20 @@ class DeepJSONDiff:
                     stat.missing_identity_right += 1
                 if strategy.missing_identity is MissingIdentityPolicy.ERROR:
                     missing = [
-                        field for field, value in zip(strategy.match_by, identity) if value is _MISSING
+                        field
+                        for field, value in zip(strategy.match_by, identity)
+                        if value is _MISSING
                     ]
                     raise IdentityExtractionError(
-                        f"missing identity field(s) {missing!r} at item index {original_index}"
+                        f"missing identity field(s) {missing!r} on {context.side} input "
+                        f"at {item_location} while applying strategy {strategy.path!r}"
                     )
                 if strategy.missing_identity is MissingIdentityPolicy.EXCLUDE:
                     continue
                 fallback.append(item)
                 continue
 
-            label = _identity_label(identity)
+            label = _identity_label(identity, strategy.match_by, item_location)
             grouped.setdefault(label, []).append(item)
 
         result: Dict[str, Any] = {}
@@ -326,12 +494,16 @@ class DeepJSONDiff:
                 else:
                     stat.duplicate_groups_right += 1
                 if strategy.duplicates is DuplicateIdentityPolicy.ERROR:
-                    raise DuplicateIdentityError(f"duplicate identity {label!r}")
+                    raise DuplicateIdentityError(
+                        f"duplicate identity {label!r} on {context.side} input at "
+                        f"{rendered} while applying strategy {strategy.path!r}"
+                    )
                 if strategy.sort_by:
                     group = sorted(
                         group,
                         key=lambda item: tuple(
-                            _stable_value(_extract(item, field)) for field in strategy.sort_by
+                            _stable_value(_extract(item, field))
+                            for field in strategy.sort_by
                         ),
                     )
                 result[label] = group
@@ -339,8 +511,6 @@ class DeepJSONDiff:
                 result[label] = group[0]
 
         if fallback:
-            # Retain fallback items under an explicit namespace. Their original
-            # relative order remains meaningful and deterministic.
             result["__deepdiff_fallback__"] = fallback
         return result
 
@@ -366,7 +536,7 @@ class DeepJSONDiff:
     def __getitem__(self, key: str) -> Any:
         return self.diff[key]
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(self.diff)
 
     def __len__(self) -> int:
@@ -379,9 +549,6 @@ class DeepJSONDiff:
         return self.diff.to_dict(*args, **kwargs)
 
     def to_json(self, *args: Any, **kwargs: Any) -> str:
-        # DeepDiff uses orjson when available. orjson intentionally rejects
-        # sort_keys, so preserve this facade's deterministic-output contract by
-        # selecting the built-in serializer unless the caller chose explicitly.
         if kwargs.get("sort_keys") and "force_use_builtin_json" not in kwargs:
             kwargs["force_use_builtin_json"] = True
         return self.diff.to_json(*args, **kwargs)
