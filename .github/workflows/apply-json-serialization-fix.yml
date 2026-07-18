@@ -1,0 +1,40 @@
+name: Apply JSON Serialization Compatibility Fix
+
+on:
+  push:
+    branches:
+      - "akshat62/path-scoped-collection-strategies"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "akshat62/path-scoped-collection-strategies"
+
+      - name: Apply narrow compatibility fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("deepdiff/json_diff.py")
+          source = path.read_text()
+          old = '''    def to_json(self, *args: Any, **kwargs: Any) -> str:\n        return self.diff.to_json(*args, **kwargs)\n'''
+          new = '''    def to_json(self, *args: Any, **kwargs: Any) -> str:\n        # DeepDiff uses orjson when available. orjson intentionally rejects\n        # sort_keys, so preserve this facade's deterministic-output contract by\n        # selecting the built-in serializer unless the caller chose explicitly.\n        if kwargs.get("sort_keys") and "force_use_builtin_json" not in kwargs:\n            kwargs["force_use_builtin_json"] = True\n        return self.diff.to_json(*args, **kwargs)\n'''
+          if old not in source:
+              raise SystemExit("target method was not found or was already patched")
+          path.write_text(source.replace(old, new))
+          PY
+
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deepdiff/json_diff.py
+          git commit -m "Handle sort_keys with optimized serialization"
+          git push origin HEAD:akshat62/path-scoped-collection-strategies
