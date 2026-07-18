@@ -136,9 +136,14 @@ def test_extract_supports_list_indexes_and_invalid_index_fallback():
 
 
 def test_stable_sort_handles_non_finite_and_structured_values():
-    circular = []
-    circular.append(circular)
-    left = {"items": [{"rank": float("inf")}, {"rank": {"b": 2, "a": 1}}, {"rank": circular}]}
+    mixed_key_mapping = {1: "numeric", "1": "string"}
+    left = {
+        "items": [
+            {"rank": float("inf")},
+            {"rank": {"b": 2, "a": 1}},
+            {"rank": mixed_key_mapping},
+        ]
+    }
     right = {"items": list(reversed(left["items"]))}
 
     result = DeepJSONDiff(
