@@ -2,16 +2,14 @@ JSON Collection Strategies
 ==========================
 
 ``DeepJSONDiff`` is an opt-in facade for comparing JSON-like values whose nested
-arrays require path-specific semantics. It canonicalizes both inputs without
-mutating them and delegates the final recursive comparison to ``DeepDiff``.
-Existing ``DeepDiff`` behaviour is unchanged.
+arrays require path-specific semantics. It builds canonical caller-isolated
+views and delegates the final recursive comparison to ``DeepDiff``. Existing
+``DeepDiff`` behaviour is unchanged.
 
 Basic identity matching
 -----------------------
 
-Use ``match_by`` when a list contains records with a stable business identity.
-Reordering does not create differences, while additions, removals and field
-changes remain visible::
+Use ``match_by`` when list records have a stable business identity::
 
     from deepdiff import CollectionStrategy, DeepJSONDiff
 
@@ -26,144 +24,137 @@ changes remain visible::
         ],
     )
 
-Nested arrays and composite keys
---------------------------------
+Reordering does not create differences. Additions, removals, and field changes
+remain visible against canonical identity-keyed paths.
 
-Array wildcards select exactly one array index under every matching parent.
-Object-key wildcards likewise select exactly one key. Relative identity fields
-may be nested and composite::
-
-    CollectionStrategy(
-        path="$.orders[*].items",
-        match_by=("product.id", "warehouse.code"),
-    )
-
-    CollectionStrategy(
-        path="$.*.users",
-        match_by=("id",),
-    )
-
-Identity fields must resolve to JSON scalar values: ``None``, booleans,
-integers, finite floats, or strings. Structured values such as dictionaries and
-lists are rejected because they do not provide a stable business identity.
-
-Filtering
+Selectors
 ---------
 
-``filter_func`` is applied symmetrically to defensive copies of both inputs
-before matching and comparison. A filter may therefore inspect or mutate the
-value it receives without changing caller-owned payloads. Filter counts are
-available through ``get_stats()``::
+Selectors use a deliberately small JSONPath-like grammar:
 
-    strategy = CollectionStrategy(
-        path="$.users",
-        match_by=("id",),
-        filter_func=lambda item: item.get("active") is True,
-    )
+- ``$.users`` selects an object key.
+- ``$.groups[0].users`` selects one array index.
+- ``$.groups[*].users`` matches exactly one array index.
+- ``$.*.users`` matches exactly one object key.
+- ``$['a-b']`` selects a quoted key that cannot be written safely in dot form.
 
-Sorting and order-insensitive arrays
-------------------------------------
+Wildcards never cross additional levels. Diagnostic paths use the same quoted
+key syntax and can be reused as selectors.
 
-``sort_by`` creates deterministic ordering for arrays where identity matching is
-not required. Numeric values use numeric ordering; missing, null, mixed, and
-structured values use a stable type-aware order.
+Relative identity and sort fields use dotted extraction and may include numeric
+list indexes, such as ``product.id`` or ``versions.0.number``.
 
-``compare_as_set`` performs multiset (bag) comparison for scalar arrays. Order
-is ignored but duplicate counts remain significant::
+Identity values
+---------------
 
-    CollectionStrategy(path="$.events", sort_by=("timestamp", "id"))
-    CollectionStrategy(path="$.roles", compare_as_set=True)
+Identity fields must resolve, after normalization, to finite JSON scalar values:
+``None``, booleans, integers, finite floats, or strings. Structured and
+non-finite values are rejected.
 
-``compare_as_set`` cannot be combined with ``match_by`` or ``sort_by``.
+Composite identities are encoded using a canonical type-preserving format, so
+values such as integer ``1``, float ``1.0``, and string ``"1"`` remain distinct
+and delimiter characters cannot cause collisions.
+
+Filtering, normalization, and exclusion
+---------------------------------------
+
+``filter_func`` and normalizers receive defensive copies and may mutate them
+without modifying caller-owned inputs. Copies are created only when callbacks
+are configured; otherwise canonicalization rebuilds the structure directly.
+
+Processing order is:
+
+1. Copy when callbacks require isolation.
+2. Apply ``filter_func``.
+3. Apply normalizers.
+4. Extract identity fields.
+5. Remove ``exclude_fields``.
+6. Canonicalize nested content.
+
+Identity fields may therefore also appear in ``exclude_fields``. They are used
+for matching but need not remain in the compared record.
+
+Sorting
+-------
+
+``sort_by`` creates a total, type-stable order for JSON-compatible values.
+Integers and floats are intentionally distinguished. Finite values, infinities,
+and NaN values have deterministic positions and do not produce mixed-type sort
+errors.
+
+Structured sort keys are supported only for JSON lists and mappings with string
+keys. Tuples, sets, mappings with non-string keys, and arbitrary objects are
+rejected rather than ordered through unstable ``repr`` output.
+
+Order-insensitive scalar arrays
+-------------------------------
+
+``compare_as_set=True`` performs multiset (bag) comparison:
+
+- order is ignored;
+- duplicate counts remain significant;
+- integer and float values remain type-distinct;
+- only finite JSON scalar values are accepted.
+
+It cannot be combined with ``match_by`` or ``sort_by``.
 
 Missing identities
 ------------------
 
-The default ``MissingIdentityPolicy.FALLBACK`` retains records lacking one or
-more identity fields and compares them using their relative order. Strict and
-exclusion policies are also available. Enum members and their string values are
-accepted::
-
-    from deepdiff import MissingIdentityPolicy
-
-    CollectionStrategy(
-        path="$.items",
-        match_by=("id",),
-        missing_identity=MissingIdentityPolicy.ERROR,
-    )
-
-    CollectionStrategy(
-        path="$.items",
-        match_by=("id",),
-        missing_identity="exclude",
-    )
+The default ``MissingIdentityPolicy.FALLBACK`` retains records missing one or
+more identity fields and compares them in relative order. ``EXCLUDE`` omits
+them, and ``ERROR`` raises ``IdentityExtractionError``. Enum members and their
+string values are accepted.
 
 Duplicate identities
 --------------------
 
-Duplicate identities raise ``DuplicateIdentityError`` by default. To compare a
-duplicate group, use ``DuplicateIdentityPolicy.GROUP`` and preferably provide a
-secondary ``sort_by`` key::
-
-    from deepdiff import DuplicateIdentityPolicy
-
-    CollectionStrategy(
-        path="$.items",
-        match_by=("id",),
-        sort_by=("version",),
-        duplicates=DuplicateIdentityPolicy.GROUP,
-    )
-
-Duplicate identities are encoded with a canonical, type-preserving format, so
-distinct composite identities cannot collide.
-
-Normalization and volatile fields
----------------------------------
-
-Normalizers run before identity extraction and comparison. Each selected item
-is deep-copied before filters and normalizers run, so callbacks may mutate their
-argument without mutating the caller's input. ``exclude_fields`` removes
-volatile top-level fields from each selected array item::
-
-    CollectionStrategy(
-        path="$.events",
-        match_by=("eventId",),
-        normalizers=(normalize_region,),
-        exclude_fields=("requestId", "generatedAt"),
-    )
+Duplicate identities raise ``DuplicateIdentityError`` by default.
+``DuplicateIdentityPolicy.GROUP`` retains every record under the identity.
+Provide ``sort_by`` when duplicate-group order is not meaningful.
 
 Rule precedence
 ---------------
 
-When multiple rules match a concrete path, higher ``priority`` wins. At equal
-priority, the pattern with more exact tokens wins. Equally specific matches are
-rejected as ambiguous instead of being resolved silently.
+Higher ``priority`` wins when multiple strategies match. At equal priority, the
+pattern with more exact tokens wins. Equally specific matches are rejected as
+ambiguous.
 
 Diagnostics
 -----------
 
-``get_stats()`` returns per-concrete-path execution information, including
-input counts, filtered counts, missing identities, duplicate groups, and the
-selected strategy name.
+``get_stats()`` separates diagnostics by input side::
+
+    stats = diff.get_stats()
+    left_users = stats["left"]["$.users"]
+    right_users = stats["right"]["$.users"]
+
+Each entry includes the selected strategy, input item count, filtered count,
+missing-identity count, and duplicate-group count. Keeping sides separate
+prevents statistics for different logical parents from being merged when a
+parent identity-matched collection is reordered.
+
+DeepDiff keyword compatibility
+------------------------------
+
+Identity matching changes selected arrays into canonical mappings. DeepDiff
+options that interpret caller-visible paths or iterable positions would
+therefore operate on a different structure. ``DeepJSONDiff`` rejects these
+path-sensitive options instead of silently changing their meaning:
+
+- ``include_paths``
+- ``exclude_paths``
+- ``exclude_regex_paths``
+- ``ignore_order_func``
+- ``iterable_compare_func``
+- ``custom_operators``
+
+Other keyword arguments are forwarded to the underlying ``DeepDiff`` instance.
 
 Result interface
 ----------------
 
-``DeepJSONDiff`` implements the standard read-only mapping interface and
-delegates serialization to the underlying ``DeepDiff`` result::
-
-    if diff:
-        print(diff["values_changed"])
-
-    for category, changes in diff.items():
-        print(category, changes)
-
-    print(diff.to_json(sort_keys=True))
-
-Compatibility
--------------
-
-``DeepJSONDiff`` is separate from ``DeepDiff`` by design. Existing constructor
-parameters, result views, Delta behaviour, iterable callbacks, and
-multiprocessing paths are not modified. Keyword arguments unrelated to
-collection strategies are forwarded to the underlying ``DeepDiff`` instance.
+``DeepJSONDiff`` is a composition-based facade, not a complete ``DeepDiff``
+subclass. It implements the read-only mapping interface and exposes ``diff`` for
+direct access to the underlying result. ``to_dict()`` and ``to_json()`` are
+delegated explicitly.
