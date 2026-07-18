@@ -39,7 +39,8 @@ Selectors use a deliberately small JSONPath-like grammar:
 - ``$['a-b']`` selects a quoted key that cannot be written safely in dot form.
 
 Wildcards never cross additional levels. Diagnostic paths use the same quoted
-key syntax and can be reused as selectors.
+key syntax and can be reused as selectors. JSON object keys are expected to be
+strings.
 
 Relative identity and sort fields use dotted extraction and may include numeric
 list indexes, such as ``product.id`` or ``versions.0.number``.
@@ -67,12 +68,12 @@ Processing order is:
 1. Copy when callbacks require isolation.
 2. Apply ``filter_func``.
 3. Apply normalizers.
-4. Extract identity fields.
+4. Extract identity and sort fields.
 5. Remove ``exclude_fields``.
 6. Canonicalize nested content.
 
-Identity fields may therefore also appear in ``exclude_fields``. They are used
-for matching but need not remain in the compared record.
+Identity and sort fields may therefore also appear in ``exclude_fields``. They
+can control matching or ordering without remaining in the compared record.
 
 Sorting
 -------
@@ -138,9 +139,9 @@ DeepDiff keyword compatibility
 ------------------------------
 
 Identity matching changes selected arrays into canonical mappings. DeepDiff
-options that interpret caller-visible paths or iterable positions would
-therefore operate on a different structure. ``DeepJSONDiff`` rejects these
-path-sensitive options instead of silently changing their meaning:
+options that interpret caller-visible paths, object paths, or iterable positions
+would therefore operate on a different structure. ``DeepJSONDiff`` rejects
+these path-sensitive options instead of silently changing their meaning:
 
 - ``include_paths``
 - ``exclude_paths``
@@ -148,6 +149,8 @@ path-sensitive options instead of silently changing their meaning:
 - ``ignore_order_func``
 - ``iterable_compare_func``
 - ``custom_operators``
+- ``exclude_obj_callback``
+- ``exclude_obj_callback_strict``
 
 Other keyword arguments are forwarded to the underlying ``DeepDiff`` instance.
 
