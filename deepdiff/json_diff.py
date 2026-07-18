@@ -379,4 +379,9 @@ class DeepJSONDiff:
         return self.diff.to_dict(*args, **kwargs)
 
     def to_json(self, *args: Any, **kwargs: Any) -> str:
+        # DeepDiff uses orjson when available. orjson intentionally rejects
+        # sort_keys, so preserve this facade's deterministic-output contract by
+        # selecting the built-in serializer unless the caller chose explicitly.
+        if kwargs.get("sort_keys") and "force_use_builtin_json" not in kwargs:
+            kwargs["force_use_builtin_json"] = True
         return self.diff.to_json(*args, **kwargs)
