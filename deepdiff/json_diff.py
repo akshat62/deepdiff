@@ -34,6 +34,8 @@ _UNSAFE_DEEPDIFF_KWARGS = {
     "ignore_order_func",
     "iterable_compare_func",
     "custom_operators",
+    "exclude_obj_callback",
+    "exclude_obj_callback_strict",
 }
 
 
@@ -231,6 +233,7 @@ class _PreparedItem:
     original_index: int
     value: Any
     identity: Optional[Tuple[Any, ...]] = None
+    sort_key: Optional[Tuple[SortKey, ...]] = None
 
 
 def _path_to_string(path: Tuple[Any, ...]) -> str:
@@ -466,13 +469,24 @@ class DeepJSONDiff(MappingABC[str, Any]):
         if strategy.match_by:
             identity = tuple(_extract(item, field) for field in strategy.match_by)
 
+        rendered = _path_to_string(path)
+        sort_key: Optional[Tuple[SortKey, ...]] = None
+        if strategy.sort_by:
+            sort_key = tuple(
+                _stable_value(
+                    _extract(item, field),
+                    location=f"{rendered} sort_by {field!r}",
+                )
+                for field in strategy.sort_by
+            )
+
         if isinstance(item, Mapping) and strategy.exclude_fields:
             item = dict(item)
             for field_name in strategy.exclude_fields:
                 item.pop(field_name, None)
 
         item = self._canonicalize(item, path + (index,), context)
-        return _PreparedItem(index, item, identity)
+        return _PreparedItem(index, item, identity, sort_key)
 
     def _canonicalize_list(
         self,
@@ -501,31 +515,21 @@ class DeepJSONDiff(MappingABC[str, Any]):
         if strategy.match_by:
             return self._index_by_identity(prepared, path, strategy, context, stat)
 
-        items = [item.value for item in prepared]
         if strategy.sort_by:
-            items = sorted(
-                items,
-                key=lambda item: tuple(
-                    _stable_value(
-                        _extract(item, field),
-                        location=f"{rendered} sort_by {field!r}",
-                    )
-                    for field in strategy.sort_by
-                ),
-            )
+            prepared = sorted(prepared, key=lambda item: item.sort_key or ())
         elif strategy.compare_as_set:
-            for item in items:
+            for item in prepared:
                 try:
-                    _scalar_component(item)
+                    _scalar_component(item.value)
                 except IdentityExtractionError as exc:
                     raise CollectionStrategyError(
                         f"compare_as_set at {rendered} supports finite JSON scalar items only"
                     ) from exc
-            items = sorted(
-                items,
-                key=lambda item: _stable_value(item, location=rendered),
+            prepared = sorted(
+                prepared,
+                key=lambda item: _stable_value(item.value, location=rendered),
             )
-        return items
+        return [item.value for item in prepared]
 
     def _index_by_identity(
         self,
@@ -536,7 +540,7 @@ class DeepJSONDiff(MappingABC[str, Any]):
         stat: StrategyStats,
     ) -> Dict[str, Any]:
         rendered = _path_to_string(path)
-        grouped: Dict[str, List[Any]] = {}
+        grouped: Dict[str, List[_PreparedItem]] = {}
         fallback: List[Any] = []
 
         for prepared_item in prepared:
@@ -562,7 +566,7 @@ class DeepJSONDiff(MappingABC[str, Any]):
                 continue
 
             label = _identity_label(identity, strategy.match_by, item_location)
-            grouped.setdefault(label, []).append(prepared_item.value)
+            grouped.setdefault(label, []).append(prepared_item)
 
         result: Dict[str, Any] = {}
         for label, group in grouped.items():
@@ -574,19 +578,10 @@ class DeepJSONDiff(MappingABC[str, Any]):
                         f"{rendered} while applying strategy {strategy.path!r}"
                     )
                 if strategy.sort_by:
-                    group = sorted(
-                        group,
-                        key=lambda item: tuple(
-                            _stable_value(
-                                _extract(item, field),
-                                location=f"{rendered} duplicate sort_by {field!r}",
-                            )
-                            for field in strategy.sort_by
-                        ),
-                    )
-                result[label] = group
+                    group = sorted(group, key=lambda item: item.sort_key or ())
+                result[label] = [item.value for item in group]
             else:
-                result[label] = group[0]
+                result[label] = group[0].value
 
         if fallback:
             result["__deepdiff_fallback__"] = fallback
